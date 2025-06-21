@@ -48,6 +48,7 @@ from lerobot.common.datasets.utils import (
     embed_images,
     get_delta_indices,
     get_episode_data_index,
+    get_features_from_robot,
     get_hf_features_from_features,
     get_safe_version,
     hf_transform_to_torch,
@@ -319,7 +320,7 @@ class LeRobotDatasetMetadata:
         repo_id: str,
         fps: int,
         features: dict,
-        robot_type: str | None = None,
+        robot: str | None = None,
         root: str | Path | None = None,
         use_videos: bool = True,
     ) -> "LeRobotDatasetMetadata":
@@ -329,7 +330,7 @@ class LeRobotDatasetMetadata:
         obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
 
         obj.root.mkdir(parents=True, exist_ok=False)
-
+        robot_type = None
         if robot is not None:
             features = get_features_from_robot(robot, use_videos)
             robot_type = robot.robot_type
@@ -359,7 +360,7 @@ class LeRobotDatasetMetadata:
         obj.tasks, obj.task_to_task_index = {}, {}
         obj.episodes_stats, obj.stats, obj.episodes = {}, {}, {}
         obj.info = create_empty_dataset_info(
-            CODEBASE_VERSION, fps, robot_type, features, use_videos
+            CODEBASE_VERSION, fps, features, use_videos, robot_type
         )
         if len(obj.video_keys) > 0 and not use_videos:
             raise ValueError()
@@ -1073,7 +1074,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         fps: int,
         features: dict,
         root: str | Path | None = None,
-        robot_type: str | None = None,
+        robot: str | None = None,
         use_videos: bool = True,
         tolerance_s: float = 1e-4,
         image_writer_processes: int = 0,
@@ -1085,7 +1086,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.meta = LeRobotDatasetMetadata.create(
             repo_id=repo_id,
             fps=fps,
-            robot_type=robot_type,
+            robot=robot,
             features=features,
             root=root,
             use_videos=use_videos,
