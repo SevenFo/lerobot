@@ -92,8 +92,9 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device):
 
 def is_torch_device_available(try_device: str) -> bool:
     try_device = str(try_device)  # Ensure try_device is a string
-    if try_device == "cuda":
-        return torch.cuda.is_available()
+    if try_device.startswith("cuda"):
+        # Check if the device index is valid
+        return torch.cuda.is_available() and torch.cuda.device_count() > int(try_device.split(":")[1]) if ":" in try_device else True
     elif try_device == "mps":
         return torch.backends.mps.is_available()
     elif try_device == "cpu":
