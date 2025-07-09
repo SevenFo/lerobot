@@ -125,6 +125,10 @@ def create_lerobot_dataset_from_config(
         # Apply feature overrides
         for feature_key, override in config.feature_overrides.items():
             if feature_key in features:
+                # Convert list to tuple for shape if needed
+                if "shape" in override and isinstance(override["shape"], list):
+                    override = override.copy()  # Don't modify original
+                    override["shape"] = tuple(override["shape"])
                 features[feature_key].update(override)
                 logger.info(f"🔧 Override applied to {feature_key}: {override}")
 

@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.config_loader import find_config_file, load_task_config
 from lerobot.utils.dataset_converter import create_lerobot_dataset_from_config
 
@@ -68,6 +69,11 @@ def main():
         action="store_true",
         help="Show what would be converted without actually converting.",
     )
+    parser.add_argument(
+        "--vis",
+        action="store_true",
+        help="visualize the dataset after conversion ",
+    )
 
     args = parser.parse_args()
 
@@ -89,47 +95,56 @@ def main():
         output_name = args.output_name or task_config.dataset_config.name
         max_episodes = args.max_episodes or task_config.dataset_config.max_episodes
 
-        logger.info("=== Dataset Conversion Configuration ===")
-        logger.info(f"Source HDF5: {source_hdf5}")
-        logger.info(f"Output name: {output_name}")
-        logger.info(f"Max episodes: {max_episodes}")
-        logger.info(f"Task: {task_config.dataset_config.task}")
-        logger.info(f"FPS: {task_config.dataset_config.fps}")
-        logger.info(f"Output root: {task_config.dataset_config.output_root}")
+        if not args.vis:
+            logger.info("=== Dataset Conversion Configuration ===")
+            logger.info(f"Source HDF5: {source_hdf5}")
+            logger.info(f"Output name: {output_name}")
+            logger.info(f"Max episodes: {max_episodes}")
+            logger.info(f"Task: {task_config.dataset_config.task}")
+            logger.info(f"FPS: {task_config.dataset_config.fps}")
+            logger.info(f"Output root: {task_config.dataset_config.output_root}")
 
-        # Show observation mapping
-        logger.info("\n=== Observation Mapping ===")
-        for isaac_key, mapping in task_config.observation_mapping.items():
-            logger.info(f"  {isaac_key} -> {mapping.policy_key} ({mapping.data_type})")
+            # Show observation mapping
+            logger.info("\n=== Observation Mapping ===")
+            for isaac_key, mapping in task_config.observation_mapping.items():
+                logger.info(
+                    f"  {isaac_key} -> {mapping.policy_key} ({mapping.data_type})"
+                )
 
-        if args.dry_run:
-            logger.info(
-                "\n=== DRY RUN MODE - No actual conversion will be performed ==="
+            if args.dry_run:
+                logger.info(
+                    "\n=== DRY RUN MODE - No actual conversion will be performed ==="
+                )
+                return
+
+            # Check if source file exists
+            if not os.path.exists(source_hdf5):
+                logger.error(f"Source HDF5 file not found: {source_hdf5}")
+                return
+
+            # Create dataset
+            logger.info("\n=== Starting Dataset Conversion ===")
+            dataset = create_lerobot_dataset_from_config(
+                config_path=config_path,
+                hdf5_path=source_hdf5,
+                output_repo_id=output_name,
+                max_episodes=max_episodes,
             )
-            return
 
-        # Check if source file exists
-        if not os.path.exists(source_hdf5):
-            logger.error(f"Source HDF5 file not found: {source_hdf5}")
-            return
+            logger.info("✅ Dataset conversion completed successfully!")
+            logger.info(f"Dataset location: {dataset.root}")
+            logger.info(f"Total episodes: {len(dataset)}")
 
-        # Create dataset
-        logger.info("\n=== Starting Dataset Conversion ===")
-        dataset = create_lerobot_dataset_from_config(
-            config_path=config_path,
-            hdf5_path=source_hdf5,
-            output_repo_id=output_name,
-            max_episodes=max_episodes,
-        )
+            # Show dataset info
+            logger.info("\n=== Dataset Information ===")
+            logger.info(f"Dataset features: {list(dataset.features.keys())}")
 
-        logger.info("✅ Dataset conversion completed successfully!")
-        logger.info(f"Dataset location: {dataset.root}")
-        logger.info(f"Total episodes: {len(dataset)}")
-
-        # Show dataset info
-        logger.info("\n=== Dataset Information ===")
-        logger.info(f"Dataset features: {list(dataset.features.keys())}")
-
+        else:
+            dataset = LeRobotDataset(
+                repo_id=output_name,
+                root=os.path.join(task_config.dataset_config.output_root, output_name),
+                episodes=[0, 1, 2],
+            )
         # Show first few samples
         logger.info("\n=== Sample Data ===")
         for i in range(min(3, len(dataset))):
@@ -137,7 +152,7 @@ def main():
             logger.info(f"Sample {i}:")
             for key, value in sample.items():
                 if hasattr(value, "shape"):
-                    logger.info(f"  {key}: {value.shape} {value.dtype}")
+                    logger.info(f"  {key}: {value.shape} {value.dtype} {value}")
                 else:
                     logger.info(f"  {key}: {value}")
 
