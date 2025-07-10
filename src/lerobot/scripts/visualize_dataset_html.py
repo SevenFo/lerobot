@@ -58,19 +58,130 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import tempfile
 from io import StringIO
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import PIL.Image
 import requests
+import torch
 from flask import Flask, redirect, render_template, request, url_for
 
 from lerobot import available_datasets
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import IterableNamespace
 from lerobot.utils.utils import init_logging
+
+
+def convert_episode_images_to_temp_video(
+    dataset: LeRobotDataset, episode_id: int, image_key: str, static_dir: Path
+) -> Path | None:
+    """
+    Extracts image frames for a specific episode, handling both PIL.Image and torch.Tensor formats,
+    saves them as temporary PNGs, and converts them into a temporary video file using ffmpeg.
+    """
+    fps = dataset.fps
+
+    with tempfile.TemporaryDirectory(
+        prefix=f"lerobot_vis_ep{episode_id}_"
+    ) as temp_image_dir:
+        temp_image_path = Path(temp_image_dir)
+        logging.info(
+            f"Extracting frames for ep {episode_id}, key '{image_key}' to {temp_image_path}"
+        )
+
+        from_idx = dataset.episode_data_index["from"][episode_id].item()
+        to_idx = dataset.episode_data_index["to"][episode_id].item()
+
+        # 使用 hf_dataset.__getitems__ 会更高效，但为了简单起见，我们继续用 select
+        # 注意：这里的 `episode_data` 仍然会应用 transform
+        episode_data = dataset.hf_dataset.select(range(from_idx, to_idx))
+
+        frame_count = 0
+        for i, item in enumerate(episode_data):
+            image_obj = item[image_key]
+
+            pil_image = None  # 我们将把任何格式都转换成这个
+
+            if isinstance(image_obj, torch.Tensor):
+                # --- 这是新的核心逻辑 ---
+                # 假设 tensor 是 CHW, float, [0, 1]
+                # 1. 反归一化
+                image_tensor = image_obj * 255.0
+
+                # 2. 确保值在 0-255 范围内，防止浮点误差
+                image_tensor = torch.clamp(image_tensor, 0, 255)
+
+                # 3. 维度重排: CHW -> HWC
+                image_tensor = image_tensor.permute(1, 2, 0)
+
+                # 4. 类型转换: Tensor -> uint8 NumPy array
+                # .cpu() 是为了确保 tensor 在 CPU 上
+                numpy_image = image_tensor.cpu().numpy().astype(np.uint8)
+
+                # 5. 创建 PIL Image 对象
+                pil_image = PIL.Image.fromarray(numpy_image)
+
+            elif isinstance(image_obj, PIL.Image.Image):
+                # 如果已经是 PIL Image，直接使用
+                pil_image = image_obj
+
+            else:
+                logging.warning(
+                    f"Item at index {i} for key '{image_key}' is not a PIL.Image or torch.Tensor. Type: {type(image_obj)}. Skipping frame."
+                )
+                continue
+
+            if pil_image:
+                frame_filename = temp_image_path / f"frame_{i:05d}.png"
+                pil_image.save(frame_filename)
+                frame_count += 1
+
+        if frame_count == 0:
+            logging.error(
+                f"No valid image frames extracted for ep {episode_id}, key '{image_key}'."
+            )
+            return None
+
+        logging.info(f"Successfully extracted {frame_count} frames.")
+
+        # --- 后续的 ffmpeg 部分保持不变 ---
+        input_pattern = temp_image_path / "frame_%05d.png"
+        temp_video_path = (
+            static_dir / f"temp_video_ep{episode_id}_{image_key.replace('.', '_')}.mp4"
+        )
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-r",
+            str(fps),
+            "-i",
+            str(input_pattern),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-loglevel",
+            "error",
+            str(temp_video_path),
+        ]
+
+        try:
+            logging.info(f"Running ffmpeg to generate temp video: {temp_video_path}")
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            return temp_video_path
+        except subprocess.CalledProcessError as e:
+            logging.error(
+                f"FFMPEG failed for ep {episode_id}, key '{image_key}':\n{e.stderr}"
+            )
+            return None
+        except FileNotFoundError:
+            logging.error("`ffmpeg` command not found. Please install it.")
+            return None
 
 
 def run_server(
@@ -81,7 +192,11 @@ def run_server(
     static_folder: Path,
     template_folder: Path,
 ):
-    app = Flask(__name__, static_folder=static_folder.resolve(), template_folder=template_folder.resolve())
+    app = Flask(
+        __name__,
+        static_folder=static_folder.resolve(),
+        template_folder=template_folder.resolve(),
+    )
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # specifying not to cache
 
     @app.route("/")
@@ -138,8 +253,12 @@ def run_server(
             )
         )
 
-    @app.route("/<string:dataset_namespace>/<string:dataset_name>/episode_<int:episode_id>")
-    def show_episode(dataset_namespace, dataset_name, episode_id, dataset=dataset, episodes=episodes):
+    @app.route(
+        "/<string:dataset_namespace>/<string:dataset_name>/episode_<int:episode_id>"
+    )
+    def show_episode(
+        dataset_namespace, dataset_name, episode_id, dataset=dataset, episodes=episodes
+    ):
         repo_id = f"{dataset_namespace}/{dataset_name}"
         try:
             if dataset is None:
@@ -150,7 +269,9 @@ def run_server(
                 400,
             )
         dataset_version = (
-            str(dataset.meta._version) if isinstance(dataset, LeRobotDataset) else dataset.codebase_version
+            str(dataset.meta._version)
+            if isinstance(dataset, LeRobotDataset)
+            else dataset.codebase_version
         )
         match = re.search(r"v(\d+)\.", dataset_version)
         if match:
@@ -158,7 +279,9 @@ def run_server(
             if major_version < 2:
                 return "Make sure to convert your LeRobotDataset to v2 & above."
 
-        episode_data_csv_str, columns, ignored_columns = get_episode_data(dataset, episode_id)
+        episode_data_csv_str, columns, ignored_columns = get_episode_data(
+            dataset, episode_id
+        )
         dataset_info = {
             "repo_id": f"{dataset_namespace}/{dataset_name}",
             "num_samples": dataset.num_frames
@@ -169,20 +292,79 @@ def run_server(
             else dataset.total_episodes,
             "fps": dataset.fps,
         }
+
+        visuals_info = []  #
+
         if isinstance(dataset, LeRobotDataset):
-            video_paths = [
-                dataset.meta.get_video_file_path(episode_id, key) for key in dataset.meta.video_keys
-            ]
-            videos_info = [
-                {
-                    "url": url_for("static", filename=str(video_path).replace("\\", "/")),
-                    "filename": video_path.parent.name,
-                }
-                for video_path in video_paths
-            ]
+            # 获取所有相机/视觉模态的键（包括视频和图像）
+            camera_keys = dataset.meta.camera_keys
+
+            # 获取 static 目录的绝对路径，用于存放临时视频
+            static_folder_abs = app.static_folder
+
+            for key in camera_keys:
+                modality_type = dataset.features[key]["dtype"]
+
+                video_path_for_flask = None  # 用来给 Flask url_for 的路径
+
+                if modality_type == "video":
+                    # 视频逻辑保持不变
+                    video_path_abs = dataset.root / dataset.meta.get_video_file_path(
+                        episode_id, key
+                    )
+                    # 创建符号链接，如果它还不存在
+                    ln_path = Path(app.static_folder) / video_path_abs.relative_to(
+                        dataset.root
+                    )
+                    if not ln_path.exists():
+                        ln_path.parent.mkdir(parents=True, exist_ok=True)
+                        ln_path.symlink_to(video_path_abs.resolve())
+
+                    video_path_for_flask = video_path_abs.relative_to(dataset.root)
+
+                elif modality_type == "image":
+                    logging.info(
+                        f"'{key}' is an image modality stored in Parquet. Attempting on-the-fly conversion for episode {episode_id}."
+                    )
+
+                    # 调用我们新的、更强大的辅助函数
+                    # 它现在能处理存储在 Parquet 里的图像了
+                    temp_video_path_abs = convert_episode_images_to_temp_video(
+                        dataset, episode_id, key, Path(app.static_folder)
+                    )
+
+                    if temp_video_path_abs:
+                        # 获取相对于 static 目录的路径
+                        video_path_for_flask = temp_video_path_abs.relative_to(
+                            app.static_folder
+                        )
+                    else:
+                        logging.warning(
+                            f"Skipping visualization for {key} due to conversion failure."
+                        )
+                        continue
+
+                if video_path_for_flask:
+                    visuals_info.append(
+                        {
+                            "url": url_for(
+                                "static",
+                                filename=str(video_path_for_flask).replace("\\", "/"),
+                            ),
+                            "filename": key,  # 使用 key 作为文件名
+                            # 'language_instruction' 稍后添加
+                        }
+                    )
+
             tasks = dataset.meta.episodes[episode_id]["tasks"]
+
+            # 将 videos_info 重命名为 visuals_info
+            videos_info = visuals_info
+
         else:
-            video_keys = [key for key, ft in dataset.features.items() if ft["dtype"] == "video"]
+            video_keys = [
+                key for key, ft in dataset.features.items() if ft["dtype"] == "video"
+            ]
             videos_info = [
                 {
                     "url": f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
@@ -197,20 +379,32 @@ def run_server(
             ]
 
             response = requests.get(
-                f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/episodes.jsonl", timeout=5
+                f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/episodes.jsonl",
+                timeout=5,
             )
             response.raise_for_status()
             # Split into lines and parse each line as JSON
-            tasks_jsonl = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+            tasks_jsonl = [
+                json.loads(line) for line in response.text.splitlines() if line.strip()
+            ]
 
-            filtered_tasks_jsonl = [row for row in tasks_jsonl if row["episode_index"] == episode_id]
+            filtered_tasks_jsonl = [
+                row for row in tasks_jsonl if row["episode_index"] == episode_id
+            ]
             tasks = filtered_tasks_jsonl[0]["tasks"]
 
-        videos_info[0]["language_instruction"] = tasks
+        print(videos_info)
+
+        if videos_info:  # 确保不为空
+            videos_info[0]["language_instruction"] = tasks
 
         if episodes is None:
             episodes = list(
-                range(dataset.num_episodes if isinstance(dataset, LeRobotDataset) else dataset.total_episodes)
+                range(
+                    dataset.num_episodes
+                    if isinstance(dataset, LeRobotDataset)
+                    else dataset.total_episodes
+                )
             )
 
         return render_template(
@@ -224,7 +418,7 @@ def run_server(
             ignored_columns=ignored_columns,
         )
 
-    app.run(host=host, port=port)
+    app.run(host=host, port=port, debug=True)
 
 
 def get_ep_csv_fname(episode_id: int):
@@ -237,7 +431,11 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
     This file will be loaded by Dygraph javascript to plot data in real time."""
     columns = []
 
-    selected_columns = [col for col, ft in dataset.features.items() if ft["dtype"] in ["float32", "int32"]]
+    selected_columns = [
+        col
+        for col, ft in dataset.features.items()
+        if ft["dtype"] in ["float32", "int32"]
+    ]
     selected_columns.remove("timestamp")
 
     ignored_columns = []
@@ -258,7 +456,10 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
             else dataset.features[column_name].shape[0]
         )
 
-        if "names" in dataset.features[column_name] and dataset.features[column_name]["names"]:
+        if (
+            "names" in dataset.features[column_name]
+            and dataset.features[column_name]["names"]
+        ):
             column_names = dataset.features[column_name]["names"]
             while not isinstance(column_names, list):
                 column_names = list(column_names.values())[0]
@@ -281,8 +482,12 @@ def get_episode_data(dataset: LeRobotDataset | IterableNamespace, episode_index)
     else:
         repo_id = dataset.repo_id
 
-        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/" + dataset.data_path.format(
-            episode_chunk=int(episode_index) // dataset.chunks_size, episode_index=episode_index
+        url = (
+            f"https://huggingface.co/datasets/{repo_id}/resolve/main/"
+            + dataset.data_path.format(
+                episode_chunk=int(episode_index) // dataset.chunks_size,
+                episode_index=episode_index,
+            )
         )
         df = pd.read_parquet(url)
         data = df[selected_columns]  # Select specific columns
@@ -315,7 +520,9 @@ def get_episode_video_paths(dataset: LeRobotDataset, ep_index: int) -> list[str]
     ]
 
 
-def get_episode_language_instruction(dataset: LeRobotDataset, ep_index: int) -> list[str]:
+def get_episode_language_instruction(
+    dataset: LeRobotDataset, ep_index: int
+) -> list[str]:
     # check if the dataset has language instructions
     if "language_instruction" not in dataset.features:
         return None
@@ -326,12 +533,15 @@ def get_episode_language_instruction(dataset: LeRobotDataset, ep_index: int) -> 
     language_instruction = dataset.hf_dataset[first_frame_idx]["language_instruction"]
     # TODO (michel-aractingi) hack to get the sentence, some strings in openx are badly stored
     # with the tf.tensor appearing in the string
-    return language_instruction.removeprefix("tf.Tensor(b'").removesuffix("', shape=(), dtype=string)")
+    return language_instruction.removeprefix("tf.Tensor(b'").removesuffix(
+        "', shape=(), dtype=string)"
+    )
 
 
 def get_dataset_info(repo_id: str) -> IterableNamespace:
     response = requests.get(
-        f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/info.json", timeout=5
+        f"https://huggingface.co/datasets/{repo_id}/resolve/main/meta/info.json",
+        timeout=5,
     )
     response.raise_for_status()  # Raises an HTTPError for bad responses
     dataset_info = response.json()
@@ -361,7 +571,9 @@ def visualize_dataset_html(
         if force_override:
             shutil.rmtree(output_dir)
         else:
-            logging.info(f"Output directory already exists. Loading from it: '{output_dir}'")
+            logging.info(
+                f"Output directory already exists. Loading from it: '{output_dir}'"
+            )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

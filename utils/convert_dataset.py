@@ -74,6 +74,22 @@ def main():
         action="store_true",
         help="visualize the dataset after conversion ",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing dataset to continue conversion.",
+    )
+    parser.add_argument(
+        "--force_resume",
+        action="store_true",
+        help="Force resume by skipping timestamp validation checks. Use this when resume fails due to synchronization issues.",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=None,
+        help="Override timestamp tolerance in seconds. Default uses dataset FPS-based tolerance.",
+    )
 
     args = parser.parse_args()
 
@@ -129,6 +145,9 @@ def main():
                 hdf5_path=source_hdf5,
                 output_repo_id=output_name,
                 max_episodes=max_episodes,
+                resume=args.resume,
+                force_resume=args.force_resume,
+                tolerance=args.tolerance,
             )
 
             logger.info("✅ Dataset conversion completed successfully!")
